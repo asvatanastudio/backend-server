@@ -1,256 +1,329 @@
+/**
+ * BACKEND API SERVER UNTUK INVENTORY
+ *
+ * Menggunakan Express dan PostgreSQL (Neon)
+ *
+ * CATATAN PENTING:
+ * - Variabel lingkungan DATABASE_URL harus disetel (via .env atau Vercel Environment Variables).
+ * - Fungsi createTables() dihilangkan untuk meningkatkan stabilitas Vercel.
+ * - Diasumsikan skema database sudah dibuat secara manual di Neon.
+ */
+
 const express = require("express");
-const cors = require("cors");
 const { Pool } = require("pg");
+const cors = require("cors");
+
+// Memuat variabel lingkungan dari file .env (hanya untuk pengembangan lokal)
+// Di Vercel, variabel ini diambil secara otomatis dari setting.
 require("dotenv").config();
+
 const app = express();
 const port = 3000;
 
-// --- KONFIGURASI DATABASE NEON/POSTGRESQL ---
+// URL database dari environment variable
 const DATABASE_URL = process.env.DATABASE_URL;
 
-if (!DATABASE_URL) {
-  console.error("PERINGATAN KRITIS: Variabel lingkungan DATABASE_URL tidak ditemukan. API akan GAGAL terhubung ke Neon.");
-  process.exit(1);
-}
-
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-});
-
-pool.query("SELECT NOW()", (err, res) => {
-  if (err) {
-    console.error("Koneksi database GAGAL:", err);
-  } else {
-    console.log("Koneksi database Neon BERHASIL pada:", res.rows[0].now);
-  }
-});
-
 // Middleware
-app.use(
-  cors({
-    origin: "*",
-    methods: "GET,HEAD,PUT,PATCH,POST,DELETE",
-  })
-);
+app.use(cors());
 app.use(express.json());
 
-// --- FUNGSI UTAMA (MEMBUAT TABEL JIKA BELUM ADA) ---
-async function createTables() {
-  try {
-    await pool.query(`
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                id_produk VARCHAR(50) UNIQUE NOT NULL,
-                nama_produk VARCHAR(100) NOT NULL,
-                kategori_produk VARCHAR(100)
-            );
-        `);
-    // TABEL INI GAGAL DIBUAT SEBELUMNYA, KAMI PASTIKAN LAGI DI SINI
-    await pool.query(`
-            CREATE TABLE IF NOT EXISTS stock (
-                id SERIAL PRIMARY KEY,
-                id_produk VARCHAR(50) UNIQUE REFERENCES products(id_produk) ON DELETE CASCADE,
-                nama_produk VARCHAR(100) NOT NULL,
-                jumlah_stok INTEGER DEFAULT 0
-            );
-        `);
-    // TABEL INI GAGAL DIBUAT SEBELUMNYA, KAMI PASTIKAN LAGI DI SINI
-    await pool.query(`
-            CREATE TABLE IF NOT EXISTS employees (
-                id SERIAL PRIMARY KEY,
-                nama VARCHAR(100) NOT NULL,
-                posisi VARCHAR(100),
-                email VARCHAR(100)
-            );
-        `);
-    console.log("Semua tabel sudah dipastikan ada.");
-  } catch (err) {
-    console.error("Gagal membuat tabel:", err);
-  }
+if (!DATABASE_URL) {
+  console.error("KRITIS: Variabel lingkungan DATABASE_URL tidak ditemukan. API akan GAGAL terhubung ke Neon.");
 }
-createTables(); // Pastikan ini dipanggil
 
-// --- PRODUCTS ROUTES (CRUD) ---
-app.get("/api/products", async (req, res) => {
+// Inisialisasi Pool Koneksi Database
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
+
+// Tes Koneksi Database
+pool
+  .connect()
+  .then((client) => {
+    console.log(`Koneksi database Neon BERHASIL pada: ${new Date().toISOString()}`);
+    client.release();
+  })
+  .catch((err) => {
+    console.error(`Gagal koneksi database Neon: ${err.message}`);
+    // Keluar jika koneksi gagal secara krusial
+  });
+
+// =============================================================================
+// HELPER: Penanganan Error Kueri
+// =============================================================================
+
+const handleQueryError = (res, error, message) => {
+  console.error(`SQL Query Error: ${message}`, error.stack);
+  res.status(500).json({ error: "Internal Server Error", message: `${message}: ${error.message}` });
+};
+
+// =============================================================================
+// ROUTE DASHBOARD (Hanya GET Ringkasan)
+// =============================================================================
+
+app.get("/api/dashboard", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM products ORDER BY id DESC");
-    res.json(result.rows);
-  } catch (err) {
-    console.error("Error GET products:", err);
-    res.status(500).send("Internal Server Error");
+    const productCountResult = await pool.query("SELECT COUNT(*) FROM products");
+    const stockSumResult = await pool.query("SELECT COALESCE(SUM(jumlah_stok), 0) AS total_stok FROM stock");
+    const employeeCountResult = await pool.query("SELECT COUNT(*) FROM employees");
+
+    const dashboardData = {
+      total_produk: parseInt(productCountResult.rows[0].count),
+      total_stok_unit: parseInt(stockSumResult.rows[0].total_stok),
+      total_karyawan: parseInt(employeeCountResult.rows[0].count),
+    };
+
+    res.json(dashboardData);
+  } catch (error) {
+    handleQueryError(res, error, "Gagal mengambil data ringkasan dashboard.");
   }
 });
 
+// =============================================================================
+// ROUTE PRODUK
+// =============================================================================
+
+// GET semua produk (dengan fitur pencarian)
+app.get("/api/products", async (req, res) => {
+  const { search } = req.query;
+  let queryText = "SELECT * FROM products";
+  const queryParams = [];
+
+  if (search) {
+    queryParams.push(`%${search}%`);
+    queryText += " WHERE nama_produk ILIKE $1 OR kategori_produk ILIKE $1 OR id_produk ILIKE $1";
+  }
+
+  try {
+    const result = await pool.query(queryText, queryParams);
+    res.json(result.rows);
+  } catch (error) {
+    handleQueryError(res, error, "Gagal mengambil data produk.");
+  }
+});
+
+// POST (Menambah) Produk Baru
 app.post("/api/products", async (req, res) => {
   const { id_produk, nama_produk, kategori_produk } = req.body;
-  if (!id_produk || !nama_produk) return res.status(400).send("ID Produk dan Nama Produk wajib diisi.");
+  const queryText = "INSERT INTO products (id_produk, nama_produk, kategori_produk) VALUES ($1, $2, $3) RETURNING *";
+  const queryParams = [id_produk, nama_produk, kategori_produk];
+
   try {
-    const result = await pool.query("INSERT INTO products (id_produk, nama_produk, kategori_produk) VALUES ($1, $2, $3) RETURNING *", [id_produk, nama_produk, kategori_produk]);
+    const result = await pool.query(queryText, queryParams);
     res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error("Error POST product:", err);
-    res.status(500).send("Gagal menambah produk. Mungkin ID Produk sudah ada.");
-  }
-});
-
-app.put("/api/products/:id", async (req, res) => {
-  const id = req.params.id;
-  const { nama_produk, kategori_produk } = req.body;
-  try {
-    const result = await pool.query("UPDATE products SET nama_produk = $1, kategori_produk = $2 WHERE id = $3 RETURNING *", [nama_produk, kategori_produk, id]);
-    if (result.rowCount === 0) return res.status(404).send("Produk tidak ditemukan.");
-
-    // PENTING: Update nama_produk di tabel stock juga
-    await pool.query("UPDATE stock SET nama_produk = $1 WHERE id_produk = (SELECT id_produk FROM products WHERE id = $2)", [nama_produk, id]);
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Error PUT product:", err);
-    res.status(500).send("Internal Server Error");
-  }
-});
-
-app.delete("/api/products/:id", async (req, res) => {
-  const id = req.params.id;
-  try {
-    // Karena ada ON DELETE CASCADE pada tabel stock,
-    // penghapusan di tabel products akan otomatis menghapus stok terkait.
-    const result = await pool.query("DELETE FROM products WHERE id = $1", [id]);
-    if (result.rowCount === 0) return res.status(404).send("Produk tidak ditemukan.");
-    res.status(204).send();
-  } catch (err) {
-    console.error("Error DELETE product:", err);
-    res.status(500).send("Internal Server Error");
-  }
-});
-
-// --- STOCK ROUTES (CRUD) ---
-app.get("/api/stock", async (req, res) => {
-  try {
-    // PERBAIKAN: Menggunakan LEFT JOIN agar tetap menampilkan data stok yang valid
-    const query = `
-            SELECT 
-                s.id, 
-                s.id_produk, 
-                p.nama_produk, 
-                s.jumlah_stok 
-            FROM stock s
-            LEFT JOIN products p ON s.id_produk = p.id_produk
-            ORDER BY s.id DESC;
-        `;
-    const result = await pool.query(query);
-    res.json(result.rows);
-  } catch (err) {
-    console.error("Error GET stock:", err);
-    res.status(500).send("Internal Server Error: Gagal mengambil data stok. Pastikan tabel stock sudah dibuat.");
-  }
-});
-
-app.post("/api/stock", async (req, res) => {
-  const { id_produk, jumlah_stok } = req.body;
-  if (!id_produk || typeof jumlah_stok !== "number") return res.status(400).send("ID Produk dan Jumlah Stok wajib diisi.");
-
-  try {
-    // Cek apakah produk ada
-    const productResult = await pool.query("SELECT nama_produk FROM products WHERE id_produk = $1", [id_produk]);
-    if (productResult.rowCount === 0) return res.status(404).send("Produk terkait tidak ditemukan.");
-    const nama_produk = productResult.rows[0].nama_produk;
-
-    // Cek apakah stok sudah ada
-    const existingStock = await pool.query("SELECT id, jumlah_stok FROM stock WHERE id_produk = $1", [id_produk]);
-
-    let result;
-    if (existingStock.rowCount > 0) {
-      // Jika sudah ada, update (misalnya penambahan stok)
-      const newStock = existingStock.rows[0].jumlah_stok + jumlah_stok;
-      result = await pool.query("UPDATE stock SET jumlah_stok = $1 WHERE id_produk = $2 RETURNING *", [newStock, id_produk]);
-    } else {
-      // Jika belum ada, masukkan baru
-      result = await pool.query("INSERT INTO stock (id_produk, nama_produk, jumlah_stok) VALUES ($1, $2, $3) RETURNING *", [id_produk, nama_produk, jumlah_stok]);
+  } catch (error) {
+    // Cek jika error adalah unique constraint violation (id_produk sudah ada)
+    if (error.code === "23505") {
+      return res.status(409).json({ error: "Conflict", message: "ID Produk sudah ada." });
     }
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error("Error POST stock:", err);
-    res.status(500).send("Gagal menambah/memperbarui stok.");
+    handleQueryError(res, error, "Gagal menambah produk baru.");
   }
 });
 
-app.put("/api/stock/:id", async (req, res) => {
-  const id = req.params.id;
-  const { jumlah_stok } = req.body;
+// PUT (Mengubah) Produk
+app.put("/api/products/:id_produk", async (req, res) => {
+  const { id_produk } = req.params;
+  const { nama_produk, kategori_produk } = req.body;
+  const queryText = "UPDATE products SET nama_produk = $1, kategori_produk = $2 WHERE id_produk = $3 RETURNING *";
+  const queryParams = [nama_produk, kategori_produk, id_produk];
+
   try {
-    const result = await pool.query("UPDATE stock SET jumlah_stok = $1 WHERE id = $2 RETURNING *", [jumlah_stok, id]);
-    if (result.rowCount === 0) return res.status(404).send("Stok tidak ditemukan.");
+    const result = await pool.query(queryText, queryParams);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Not Found", message: "Produk tidak ditemukan." });
+    }
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Error PUT stock:", err);
-    res.status(500).send("Internal Server Error");
+  } catch (error) {
+    handleQueryError(res, error, `Gagal mengubah produk dengan ID ${id_produk}.`);
   }
 });
 
-app.delete("/api/stock/:id", async (req, res) => {
-  const id = req.params.id;
+// DELETE Produk
+app.delete("/api/products/:id_produk", async (req, res) => {
+  const { id_produk } = req.params;
+  const queryText = "DELETE FROM products WHERE id_produk = $1 RETURNING *";
+
   try {
-    const result = await pool.query("DELETE FROM stock WHERE id = $1", [id]);
-    if (result.rowCount === 0) return res.status(404).send("Stok tidak ditemukan.");
-    res.status(204).send();
-  } catch (err) {
-    console.error("Error DELETE stock:", err);
-    res.status(500).send("Internal Server Error");
+    const result = await pool.query(queryText, [id_produk]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Not Found", message: "Produk tidak ditemukan." });
+    }
+    res.json({ message: "Produk berhasil dihapus", deleted_product: result.rows[0] });
+  } catch (error) {
+    handleQueryError(res, error, `Gagal menghapus produk dengan ID ${id_produk}.`);
   }
 });
 
-// --- EMPLOYEE ROUTES (CRUD) ---
-app.get("/api/employees", async (req, res) => {
+// =============================================================================
+// ROUTE STOK
+// =============================================================================
+
+// GET semua stok (digabung dengan nama produk)
+app.get("/api/stock", async (req, res) => {
+  const { search } = req.query;
+  let queryText = `
+        SELECT
+            s.id,
+            s.id_produk,
+            s.nama_produk,
+            s.jumlah_stok,
+            p.kategori_produk
+        FROM stock s
+        LEFT JOIN products p ON s.id_produk = p.id_produk
+    `;
+  const queryParams = [];
+
+  if (search) {
+    queryParams.push(`%${search}%`);
+    queryText += " WHERE s.nama_produk ILIKE $1 OR s.id_produk ILIKE $1";
+  }
+
   try {
-    // Kueri sederhana SELECT * FROM employees
-    const result = await pool.query("SELECT * FROM employees ORDER BY id DESC");
+    const result = await pool.query(queryText, queryParams);
     res.json(result.rows);
-  } catch (err) {
-    // Kemungkinan error: Tabel 'employees' tidak ditemukan
-    console.error("Error GET employees:", err);
-    res.status(500).send("Internal Server Error: Gagal mengambil data karyawan. Pastikan tabel employees sudah dibuat.");
+  } catch (error) {
+    handleQueryError(res, error, "Gagal mengambil data stok. Pastikan tabel stock sudah dibuat.");
   }
 });
 
+// POST (Menambah) Stok Baru
+app.post("/api/stock", async (req, res) => {
+  const { id_produk, nama_produk, jumlah_stok } = req.body;
+  // Perlu cek apakah id_produk ada di tabel products (akan dicek oleh Foreign Key)
+  const queryText = "INSERT INTO stock (id_produk, nama_produk, jumlah_stok) VALUES ($1, $2, $3) RETURNING *";
+  const queryParams = [id_produk, nama_produk, jumlah_stok];
+
+  try {
+    const result = await pool.query(queryText, queryParams);
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    if (error.code === "23503") {
+      // Foreign key violation
+      return res.status(400).json({ error: "Bad Request", message: "ID Produk tidak ada di tabel Produk." });
+    }
+    if (error.code === "23505") {
+      // Unique constraint violation
+      return res.status(409).json({ error: "Conflict", message: "Stok untuk ID Produk ini sudah ada. Gunakan PUT untuk mengubah jumlah." });
+    }
+    handleQueryError(res, error, "Gagal menambah stok baru.");
+  }
+});
+
+// PUT (Mengubah) Stok (berdasarkan id_produk)
+app.put("/api/stock/:id_produk", async (req, res) => {
+  const { id_produk } = req.params;
+  const { jumlah_stok } = req.body;
+  const queryText = "UPDATE stock SET jumlah_stok = $1 WHERE id_produk = $2 RETURNING *";
+  const queryParams = [jumlah_stok, id_produk];
+
+  try {
+    const result = await pool.query(queryText, queryParams);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Not Found", message: "Stok untuk produk ini tidak ditemukan." });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    handleQueryError(res, error, `Gagal mengubah stok untuk ID ${id_produk}.`);
+  }
+});
+
+// DELETE Stok
+app.delete("/api/stock/:id_produk", async (req, res) => {
+  const { id_produk } = req.params;
+  const queryText = "DELETE FROM stock WHERE id_produk = $1 RETURNING *";
+
+  try {
+    const result = await pool.query(queryText, [id_produk]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Not Found", message: "Stok untuk produk ini tidak ditemukan." });
+    }
+    res.json({ message: "Stok berhasil dihapus", deleted_stock: result.rows[0] });
+  } catch (error) {
+    handleQueryError(res, error, `Gagal menghapus stok untuk ID ${id_produk}.`);
+  }
+});
+
+// =============================================================================
+// ROUTE KARYAWAN
+// =============================================================================
+
+// GET semua karyawan (dengan fitur pencarian)
+app.get("/api/employees", async (req, res) => {
+  const { search } = req.query;
+  let queryText = "SELECT * FROM employees";
+  const queryParams = [];
+
+  if (search) {
+    queryParams.push(`%${search}%`);
+    queryText += " WHERE nama ILIKE $1 OR posisi ILIKE $1 OR email ILIKE $1";
+  }
+
+  try {
+    const result = await pool.query(queryText, queryParams);
+    res.json(result.rows);
+  } catch (error) {
+    handleQueryError(res, error, "Gagal mengambil data karyawan. Pastikan tabel employees sudah dibuat.");
+  }
+});
+
+// POST (Menambah) Karyawan Baru
 app.post("/api/employees", async (req, res) => {
   const { nama, posisi, email } = req.body;
-  if (!nama || !posisi) return res.status(400).send("Nama dan Posisi wajib diisi.");
+  const queryText = "INSERT INTO employees (nama, posisi, email) VALUES ($1, $2, $3) RETURNING *";
+  const queryParams = [nama, posisi, email];
+
   try {
-    const result = await pool.query("INSERT INTO employees (nama, posisi, email) VALUES ($1, $2, $3) RETURNING *", [nama, posisi, email]);
+    const result = await pool.query(queryText, queryParams);
     res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error("Error POST employee:", err);
-    res.status(500).send("Gagal menambah karyawan.");
+  } catch (error) {
+    handleQueryError(res, error, "Gagal menambah karyawan baru.");
   }
 });
 
+// PUT (Mengubah) Karyawan
 app.put("/api/employees/:id", async (req, res) => {
-  const id = req.params.id;
+  const { id } = req.params;
   const { nama, posisi, email } = req.body;
+  const queryText = "UPDATE employees SET nama = $1, posisi = $2, email = $3 WHERE id = $4 RETURNING *";
+  const queryParams = [nama, posisi, email, id];
+
   try {
-    const result = await pool.query("UPDATE employees SET nama = $1, posisi = $2, email = $3 WHERE id = $4 RETURNING *", [nama, posisi, email, id]);
-    if (result.rowCount === 0) return res.status(404).send("Karyawan tidak ditemukan.");
+    const result = await pool.query(queryText, queryParams);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Not Found", message: "Karyawan tidak ditemukan." });
+    }
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Error PUT employee:", err);
-    res.status(500).send("Internal Server Error");
+  } catch (error) {
+    handleQueryError(res, error, `Gagal mengubah data karyawan dengan ID ${id}.`);
   }
 });
 
+// DELETE Karyawan
 app.delete("/api/employees/:id", async (req, res) => {
-  const id = req.params.id;
+  const { id } = req.params;
+  const queryText = "DELETE FROM employees WHERE id = $1 RETURNING *";
+
   try {
-    const result = await pool.query("DELETE FROM employees WHERE id = $1", [id]);
-    if (result.rowCount === 0) return res.status(404).send("Karyawan tidak ditemukan.");
-    res.status(204).send();
-  } catch (err) {
-    console.error("Error DELETE employee:", err);
-    res.status(500).send("Internal Server Error");
+    const result = await pool.query(queryText, [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Not Found", message: "Karyawan tidak ditemukan." });
+    }
+    res.json({ message: "Karyawan berhasil dihapus", deleted_employee: result.rows[0] });
+  } catch (error) {
+    handleQueryError(res, error, `Gagal menghapus karyawan dengan ID ${id}.`);
   }
 });
 
-// Start Server
-app.listen(port, () => {
-  console.log(`Server API berjalan di http://localhost:${port}`);
-});
+// Route catch-all untuk deployment Vercel
+// Vercel akan secara otomatis menangani listening port saat deployment
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`Server API berjalan di http://localhost:${port}`);
+  });
+}
+
+// Ekspor handler Express untuk Serverless Function Vercel
+module.exports = app;
